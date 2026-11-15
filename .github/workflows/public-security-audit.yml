@@ -154,21 +154,19 @@ jobs:
           allow_issue_writing: false
           artifact_name: zap-baseline-raw
 
-      - name: Install verified Nuclei release
+      - name: Install pinned Nuclei and its templates
         if: ${{ github.event_name == 'push' || inputs.run_nuclei }}
         shell: bash
         run: |
           set -euo pipefail
-          cd tools
-          base="https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}"
-          curl --fail --silent --show-error --location \
-            --output nuclei-checksums.txt "$base/nuclei_${NUCLEI_VERSION}_checksums.txt"
-          curl --fail --silent --show-error --location \
-            --output nuclei.zip "$base/nuclei_${NUCLEI_VERSION}_linux_amd64.zip"
-          grep "nuclei_${NUCLEI_VERSION}_linux_amd64.zip" nuclei-checksums.txt | sha256sum --check --status
-          unzip -q nuclei.zip -d nuclei
-          ./nuclei/nuclei -version > "$GITHUB_WORKSPACE/reports/nuclei-version.txt"
-          ./nuclei/nuclei -update-templates > "$GITHUB_WORKSPACE/reports/nuclei-template-update.txt" 2>&1
+          # GitHub-hosted Ubuntu runners include Go. Pinning the module version avoids
+          # relying on a mutable container tag or an unverified architecture-specific asset.
+          mkdir -p "$GITHUB_WORKSPACE/tools/bin"
+          GOBIN="$GITHUB_WORKSPACE/tools/bin" go install \
+            "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@v${NUCLEI_VERSION}"
+          "$GITHUB_WORKSPACE/tools/bin/nuclei" -version > "$GITHUB_WORKSPACE/reports/nuclei-version.txt"
+          "$GITHUB_WORKSPACE/tools/bin/nuclei" -update-templates \
+            > "$GITHUB_WORKSPACE/reports/nuclei-template-update.txt" 2>&1
 
       - name: Run bounded Nuclei exposure and misconfiguration checks
         if: ${{ github.event_name == 'push' || inputs.run_nuclei }}
@@ -178,7 +176,7 @@ jobs:
           : > reports/nuclei.jsonl
           # This does not run fuzzing, DoS, browser automation, network-service, or OAST checks.
           # The rate limit is deliberately low to reduce impact on the production site.
-          tools/nuclei/nuclei -u "$TARGET_URL" \
+          tools/bin/nuclei -u "$TARGET_URL" \
             -severity low,medium,high,critical \
             -exclude-tags fuzz,dos,headless,network \
             -no-interactsh -rate-limit 3 -timeout 10 -retries 1 \
