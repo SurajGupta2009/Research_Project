@@ -106,7 +106,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           # testssl.sh requires hexdump, supplied by bsdextrautils on Ubuntu.
-          sudo apt-get install --yes nmap unzip bsdextrautils
+          sudo apt-get install --yes nmap bsdextrautils
           nmap --version | head -n2 > reports/nmap-version.txt
 
       - name: Scan common public services and TLS configuration
@@ -118,7 +118,7 @@ jobs:
           # No UDP, brute-force, vulnerability, or denial-of-service scripts are enabled.
           nmap -Pn -n -sV --version-light --top-ports 100 --max-retries 1 --host-timeout 5m -T3 \
             --script 'http-security-headers,ssl-enum-ciphers' \
-            -oA reports/nmap "$TARGET_HOST"
+            -oA reports/nmap "$TARGET_HOST" > reports/nmap-console.txt 2>&1
           code=$?
           echo "$code" > reports/nmap-exit-code.txt
           exit 0
@@ -139,13 +139,20 @@ jobs:
           exit 0
 
       - name: Run OWASP ZAP baseline passive scan
-        uses: zaproxy/action-baseline@v0.15.0
-        with:
-          target: https://profruits.in
-          cmd_options: -m 2 -T 10
-          fail_action: false
-          allow_issue_writing: false
-          artifact_name: zap-baseline-raw
+        shell: bash
+        run: |
+          set +e
+          # Run the passive baseline scan directly so it never creates a separate
+          # public artifact. Its reports remain only in the runner's reports folder.
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE/reports:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t "$TARGET_URL" -m 2 -T 10 \
+            -J zap-baseline.json -r zap-baseline.html -w zap-baseline.md \
+            > reports/zap-console.txt 2>&1
+          code=$?
+          echo "$code" > reports/zap-exit-code.txt
+          exit 0
 
       - name: Install pinned Nuclei and its templates
         if: ${{ inputs.run_nuclei }}
@@ -191,11 +198,20 @@ jobs:
           done
           find reports -maxdepth 2 -type f -printf '%p\n' | sort > reports/file-manifest.txt
 
-      - name: Upload security-audit evidence
-        if: ${{ always() }}
+      # Security-scan findings can reveal configuration details. Do not retain them
+      # on a public GitHub repository, where repository readers may access artifacts.
+      - name: Upload security-audit evidence for a private repository
+        if: ${{ always() && github.event.repository.private }}
         uses: actions/upload-artifact@v4
         with:
           name: profruits-public-security-audit
           path: reports/
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Suppress report upload for a public repository
+        if: ${{ always() && !github.event.repository.private }}
+        shell: bash
+        run: |
+          echo 'Reports were not uploaded because this repository is public.'
+          echo 'Run this workflow from a private repository to retain security findings as an artifact.'
