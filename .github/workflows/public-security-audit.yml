@@ -1,0 +1,201 @@
+name: Public unauthenticated security audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      authorization_confirmed:
+        description: I own or am explicitly authorized to assess only profruits.in
+        required: true
+        type: boolean
+        default: false
+      run_nmap:
+        description: Run a low-rate top-100 TCP service and TLS/header configuration scan
+        required: true
+        type: boolean
+        default: true
+      run_nuclei:
+        description: Run non-destructive Nuclei exposure and misconfiguration templates
+        required: true
+        type: boolean
+        default: true
+
+# This workflow intentionally has no target input. It is scoped to the owner's stated
+# public site and does not use credentials, brute force, exploitation, load testing,
+# fuzzing, OAST callbacks, or state-changing checks.
+permissions:
+  contents: read
+
+concurrency:
+  group: public-security-audit-profruits-in
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Public security checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      TARGET_URL: https://profruits.in
+      TARGET_HOST: profruits.in
+      NUCLEI_VERSION: 3.11.1
+      TESTSSL_COMMIT: 711a07ada11bc6d4681264e7a5c003b5c03bb588
+    steps:
+      - name: Confirm scope and prepare reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ '${{ inputs.authorization_confirmed }}' != 'true' ]]; then
+            echo 'Authorization was not confirmed; refusing to run.' >&2
+            exit 1
+          fi
+          # The target is deliberately constant to prevent this workflow being reused
+          # as a scanner for an arbitrary host.
+          [[ "$TARGET_URL" == 'https://profruits.in' ]]
+          [[ "$TARGET_HOST" == 'profruits.in' ]]
+          mkdir -p reports tools
+          cat > reports/README.md <<'EOF'
+          # Public unauthenticated security-audit evidence
+
+          **Scope:** `https://profruits.in` only, based on the site owner's authorization.
+
+          These checks are deliberately bounded and non-destructive. They collect public
+          HTTP/TLS/DNS evidence, run a top-100-port configuration scan, run the OWASP ZAP
+          *baseline* (passive) scan, and, when enabled, low-rate Nuclei checks that exclude
+          fuzzing, denial-of-service, headless-browser, network-service, and OAST templates.
+
+          A tool alert is not a confirmed vulnerability. Validate each result, consider the
+          application's intended behavior, and avoid publishing raw reports if they reveal
+          server versions, paths, or configuration details.
+          EOF
+
+      - name: Record public HTTP, DNS, and certificate evidence
+        shell: bash
+        run: |
+          set -u
+          {
+            echo "UTC: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "Target: $TARGET_URL"
+            echo "curl: $(curl --version | head -n1)"
+          } > reports/run-metadata.txt
+
+          getent ahosts "$TARGET_HOST" > reports/dns-addresses.txt 2>&1 || true
+
+          curl --silent --show-error --location \
+            --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 45 \
+            --dump-header reports/http-headers.txt --output /dev/null \
+            --write-out 'http_code=%{http_code}\nremote_ip=%{remote_ip}\nurl_effective=%{url_effective}\nssl_verify_result=%{ssl_verify_result}\n' \
+            "$TARGET_URL" > reports/http-request-metadata.txt 2> reports/http-request-error.txt || true
+
+          for path in /.well-known/security.txt /robots.txt; do
+            safe_name="$(printf '%s' "$path" | tr '/.' '__')"
+            curl --silent --show-error --location --proto '=https' --tlsv1.2 \
+              --connect-timeout 15 --max-time 30 "$TARGET_URL$path" \
+              --output "reports/${safe_name}" \
+              2> "reports/${safe_name}.error" || true
+          done
+
+          timeout 30 openssl s_client -connect "${TARGET_HOST}:443" -servername "$TARGET_HOST" \
+            -showcerts </dev/null > reports/openssl-sclient.txt 2>&1 || true
+          timeout 30 openssl s_client -connect "${TARGET_HOST}:443" -servername "$TARGET_HOST" \
+            </dev/null 2>/dev/null | openssl x509 -noout -subject -issuer -dates -serial -ext subjectAltName \
+            > reports/certificate-summary.txt 2> reports/certificate-summary.error || true
+
+      - name: Install bounded scanning utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # testssl.sh requires hexdump, supplied by bsdextrautils on Ubuntu.
+          sudo apt-get install --yes nmap unzip bsdextrautils
+          nmap --version | head -n2 > reports/nmap-version.txt
+
+      - name: Scan common public services and TLS configuration
+        if: ${{ inputs.run_nmap }}
+        shell: bash
+        run: |
+          set +e
+          # Top 100 ports, light service detection, one retry, and a five-minute host cap.
+          # No UDP, brute-force, vulnerability, or denial-of-service scripts are enabled.
+          nmap -Pn -n -sV --version-light --top-ports 100 --max-retries 1 --host-timeout 5m -T3 \
+            --script 'http-security-headers,ssl-enum-ciphers' \
+            -oA reports/nmap "$TARGET_HOST"
+          code=$?
+          echo "$code" > reports/nmap-exit-code.txt
+          exit 0
+
+      - name: Run pinned testssl.sh configuration checks
+        shell: bash
+        run: |
+          set +e
+          git clone --depth 1 https://github.com/testssl/testssl.sh.git tools/testssl
+          cd tools/testssl || exit 0
+          git fetch --depth 1 origin "$TESTSSL_COMMIT"
+          git checkout --detach "$TESTSSL_COMMIT"
+          ./testssl.sh --quiet --warnings batch --connect-timeout 10 --openssl-timeout 10 \
+            --jsonfile-pretty "$GITHUB_WORKSPACE/reports/testssl.json" "${TARGET_HOST}:443" \
+            > "$GITHUB_WORKSPACE/reports/testssl-console.txt" 2>&1
+          code=$?
+          echo "$code" > "$GITHUB_WORKSPACE/reports/testssl-exit-code.txt"
+          exit 0
+
+      - name: Run OWASP ZAP baseline passive scan
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: https://profruits.in
+          cmd_options: -m 2 -T 10
+          fail_action: false
+          allow_issue_writing: false
+          artifact_name: zap-baseline-raw
+
+      - name: Install pinned Nuclei and its templates
+        if: ${{ inputs.run_nuclei }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GitHub-hosted Ubuntu runners include Go. Pinning the module version avoids
+          # relying on a mutable container tag or an unverified architecture-specific asset.
+          mkdir -p "$GITHUB_WORKSPACE/tools/bin"
+          GOBIN="$GITHUB_WORKSPACE/tools/bin" go install \
+            "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@v${NUCLEI_VERSION}"
+          "$GITHUB_WORKSPACE/tools/bin/nuclei" -version > "$GITHUB_WORKSPACE/reports/nuclei-version.txt"
+          "$GITHUB_WORKSPACE/tools/bin/nuclei" -update-templates \
+            > "$GITHUB_WORKSPACE/reports/nuclei-template-update.txt" 2>&1
+
+      - name: Run bounded Nuclei exposure and misconfiguration checks
+        if: ${{ inputs.run_nuclei }}
+        shell: bash
+        run: |
+          set +e
+          : > reports/nuclei.jsonl
+          # This does not run fuzzing, DoS, browser automation, network-service, or OAST checks.
+          # The rate limit is deliberately low to reduce impact on the production site.
+          tools/bin/nuclei -u "$TARGET_URL" \
+            -tags exposure,misconfig,tech \
+            -severity low,medium,high,critical \
+            -exclude-tags fuzz,dos,headless,network \
+            -no-interactsh -rate-limit 3 -timeout 10 -retries 1 \
+            -json-export reports/nuclei.jsonl \
+            > reports/nuclei-console.txt 2>&1
+          code=$?
+          echo "$code" > reports/nuclei-exit-code.txt
+          exit 0
+
+      - name: Collect ZAP reports into the audit artifact
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +e
+          mkdir -p reports/zap
+          for report in report_html.html report_json.json report_md.md; do
+            [[ -f "$report" ]] && mv "$report" "reports/zap/$report"
+          done
+          find reports -maxdepth 2 -type f -printf '%p\n' | sort > reports/file-manifest.txt
+
+      - name: Upload security-audit evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: profruits-public-security-audit
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
